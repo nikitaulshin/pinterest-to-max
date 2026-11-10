@@ -1,0 +1,13 @@
+services:
+  app:
+    build: .
+    init: true
+    environment:
+      DATA_DIR: /app/data
+    volumes:
+      - app-data:/app/data
+    shm_size: 1gb
+    stop_grace_period: 15s
+
+volumes:
+  app-data:

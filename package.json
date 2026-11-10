@@ -1,0 +1,30 @@
+{
+  "name": "pinterest-to-max",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Автоматизация отложенных публикаций изображений из Pinterest в MAX",
+  "type": "module",
+  "engines": {
+    "node": ">=24.15.0 <25"
+  },
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --watch src/main.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node --env-file-if-exists=.env dist/main.js",
+    "test": "npm run build && node --test tests/*.test.ts",
+    "lint": "eslint . --max-warnings=0",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run lint && npm run typecheck && npm test",
+    "browser:install": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "1.65.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.19.2",
+    "eslint": "10.14.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.72.1"
+  }
+}
