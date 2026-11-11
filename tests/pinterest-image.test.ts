@@ -35,11 +35,12 @@ async function fixture() {
   const request = { async get(url: string, options: { maxRedirects: number }) {
     requests.push(url);
     assert.equal(options.maxRedirects, 0, 'Redirects must never be followed automatically');
+    if (mode === 'network') throw new Error('ECONNRESET https://i.pinimg.com/a?token=secret');
     if (mode === 'abort' || (mode === 'abort-large' && url === large)) throw new Error('Connection aborted');
     const original = bodies.get(url)!;
     const body = mode === 'corrupt' ? Buffer.concat([original.subarray(0, 8), Buffer.alloc(original.length - 20), original.subarray(-12)]) : mode === 'html' ? Buffer.from('<html>Login</html>') : mode === 'truncated' ? original.subarray(0, original.length - 12) : original;
 
-    return { status: () => mode === 'redirect' ? 302 : 200, url: () => url, headers: () => ({ 'content-type': mode === 'html' ? 'text/html' : 'image/png', 'content-length': String(mode === 'truncated' ? original.length : body.length) }), body: async () => body, dispose: async () => {} };
+    return { status: () => mode === 'temporary-http' ? 503 : mode === 'forbidden' ? 403 : mode === 'redirect' ? 302 : 200, url: () => url, headers: () => ({ 'content-type': mode === 'html' ? 'text/html' : 'image/png', 'content-length': String(mode === 'truncated' ? original.length : body.length) }), body: async () => body, dispose: async () => {} };
   } };
   const downloadPage = { context: () => ({ request }), evaluate: page.evaluate.bind(page) } as unknown as Page;
 
@@ -130,5 +131,18 @@ test('an arbitrary confirmed source opens its pin directly without traversing th
     const extracted = await extractPin(f.page, pin, 'https://ru.pinterest.com/example/board/');
     assert.deepEqual(navigations, [pin.url], 'Arbitrary extraction must not navigate to the board or slot zero');
     assert.deepEqual(extracted.imageUrls, [small, large], 'Card maximum must survive closeup extraction');
+  } finally { await f.close(); }
+});
+
+for (const mode of ['network', 'temporary-http', 'forbidden', 'corrupt']) test(`classifies ${mode} without saving a partial file`, async () => {
+  const f = await fixture();
+  f.mode(mode);
+  try {
+    const result = await downloadPinImage(f.downloadPage, pin, f.directory);
+    assert.equal(result.status, 'failed', 'The source must retain a failed outcome');
+    if (result.status !== 'failed') return;
+    assert.equal(result.code, ['network', 'temporary-http'].includes(mode) ? 'network' : 'unknown', 'Only proven transport and temporary HTTP errors may request retry');
+    assert.doesNotMatch(result.reason, /token=secret/, 'Public reasons must not expose raw CDN queries');
+    await assert.rejects(readdir(join(f.directory, 'images')), { code: 'ENOENT' }, 'Failed input must not create a ready file');
   } finally { await f.close(); }
 });

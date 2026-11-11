@@ -2,8 +2,17 @@ services:
   app:
     build: .
     init: true
+    command: ["run"]
     environment:
       DATA_DIR: /app/data
+      PINTEREST_BROWSER_CHANNEL: chromium
+      MAX_BROWSER_CHANNEL: chromium
+      PINTEREST_BOARD_URL: ${PINTEREST_BOARD_URL:-https://ru.pinterest.com/mixi56453/max7}
+      MAX_CHANNEL_URL: ${MAX_CHANNEL_URL:-}
+      PUBLICATION_SLOTS: ${PUBLICATION_SLOTS:-}
+      MAX_SCHEDULED_LIMIT: ${MAX_SCHEDULED_LIMIT:-}
+      PLANNING_HORIZON_DAYS: ${PLANNING_HORIZON_DAYS:-14}
+      SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-300}
     volumes:
       - app-data:/app/data
     shm_size: 1gb

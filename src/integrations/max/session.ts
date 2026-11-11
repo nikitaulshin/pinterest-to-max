@@ -1,8 +1,21 @@
 import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { IntegrationFailure, integrationFailure } from '../failure.ts';
+import { reportBrowserFailure } from '../diagnostics.ts';
 import { setTimeout } from 'node:timers/promises';
 import { chromium, type Page } from 'playwright';
+
+/** Открывает канал только по проверенной наблюдённой ссылке landing-страницы. */
+export async function openMaxChannel(page: Page, channelUrl: string): Promise<void> {
+  await page.goto(channelUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  const browser = page.getByRole('link', { name: 'Открыть в браузере', exact: true });
+  await browser.waitFor({ state: 'visible', timeout: 30_000 });
+  if (await browser.count() !== 1 || await browser.getAttribute('href') !== `https://web.max.ru${new URL(channelUrl).pathname}`) {
+    throw new Error('MAX: ссылка веб-интерфейса заданного канала не подтверждена.');
+  }
+  await browser.click();
+}
 
 /** Проверяет видимый профиль канала и доступные действия без чтения сообщений и полей. */
 export async function readChannelAccess(page: Page, channelUrl: string): Promise<'auth-required' | 'ready' | 'mismatch' | 'unknown'> {
@@ -22,9 +35,7 @@ export async function readChannelAccess(page: Page, channelUrl: string): Promise
   if ((await identity.innerText()).trim() !== channelUrl) return 'mismatch';
 
   const upload = page.getByRole('button', { name: 'Загрузить файл', exact: true });
-  const scheduled = page.getByRole('button', { name: 'Открыть отложенные сообщения', exact: true });
-  if (await upload.count() !== 1 || !await upload.isVisible() || !await upload.isEnabled()
-    || await scheduled.count() !== 1 || !await scheduled.isVisible() || !await scheduled.isEnabled()) return 'unknown';
+  if (await upload.count() !== 1 || !await upload.isVisible() || !await upload.isEnabled()) return 'unknown';
 
   return page.url() === location.href ? 'ready' : 'unknown';
 }
@@ -35,8 +46,13 @@ export async function authenticateMax(configuration: { dataDirectory: string; ch
   mkdirSync(profile, { recursive: true, mode: 0o700 });
   const context = await chromium.launchPersistentContext(profile, {
     headless: false,
+    timezoneId: 'Europe/Moscow',
     ...(configuration.channel === 'chrome' ? { channel: 'chrome' } : {}),
-  }).catch(() => { throw new Error('MAX: не удалось открыть браузер. Проверьте установку выбранного браузера и владельца профиля.'); });
+  }).catch(async (error: unknown) => {
+    throw await reportBrowserFailure({ service: 'max', operation: 'auth',
+      directory: join(configuration.dataDirectory, 'diagnostics', `max-auth-${randomUUID()}`),
+      error: new IntegrationFailure(integrationFailure(error).code, 'MAX: не удалось открыть браузер; проверьте установку выбранного браузера и владельца профиля.', undefined, error) });
+  });
   const controller = new AbortController();
   const stop = () => controller.abort();
   process.once('SIGINT', stop);
@@ -44,13 +60,7 @@ export async function authenticateMax(configuration: { dataDirectory: string; ch
 
   try {
     const page = context.pages()[0] ?? await context.newPage();
-    await page.goto(configuration.channelUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    const browser = page.getByRole('link', { name: 'Открыть в браузере', exact: true });
-    await browser.waitFor({ state: 'visible', timeout: 30_000 });
-    if (await browser.count() !== 1 || await browser.getAttribute('href') !== `https://web.max.ru${new URL(configuration.channelUrl).pathname}`) {
-      throw new Error('MAX: ссылка веб-интерфейса заданного канала не подтверждена.');
-    }
-    await browser.click();
+    await openMaxChannel(page, configuration.channelUrl);
 
     let prompted = false;
     let profileOpened = false;
@@ -80,20 +90,12 @@ export async function authenticateMax(configuration: { dataDirectory: string; ch
     throw new Error('MAX: доступ не подтверждён за 5 минут; повторите auth max.');
   } catch (error) {
     if (controller.signal.aborted) return false;
-    const diagnostics = join(configuration.dataDirectory, 'diagnostics', `max-auth-${randomUUID()}`);
-    let screenshotAvailable = false;
-    try {
-      mkdirSync(diagnostics, { recursive: true, mode: 0o700 });
-      await context.pages()[0]?.screenshot({ path: join(diagnostics, 'error.png') });
-      screenshotAvailable = context.pages().length > 0;
-    } catch { /* Диагностика не подменяет исходную ошибку браузера. */ }
-    console.error(JSON.stringify({ event: 'browser-error', service: 'max', operation: 'auth', code: 'access-unconfirmed', diagnostics, screenshotAvailable }));
-    if (error instanceof Error && error.message.startsWith('MAX:')) throw error;
-
-    throw new Error('MAX: браузерная проверка не завершена. Проверьте сеть и доступ, затем повторите auth max.', { cause: error });
+    throw await reportBrowserFailure({ service: 'max', operation: 'auth',
+      directory: join(configuration.dataDirectory, 'diagnostics', `max-auth-${randomUUID()}`),
+      error, page: context.pages()[0] });
   } finally {
     process.removeListener('SIGINT', stop);
     process.removeListener('SIGTERM', stop);
-    await context.close();
+    await context.close().catch(() => {});
   }
 }

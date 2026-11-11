@@ -1,4 +1,5 @@
 import { resolve } from 'node:path';
+import { PublicationSchedule } from './core/planning.ts';
 
 /** Описывает только реализованные команды и их влияние на данные. */
 export const help = `Использование: npm start -- [команда]
@@ -18,18 +19,27 @@ export const help = `Использование: npm start -- [команда]
   queue retry ID  Повторить failed без созданного поста с прежним порядком;
                   preparing/submitting/scheduled запрещены, uncertain требует сверки.
   queue list      Снимок очереди и источников без изменения данных и браузера.
+  run             Независимые циклы импорта и пополнения MAX до SIGINT/SIGTERM;
+                  требует bootstrap/backfill и привязанный канал auth max.
+  plan --dry-run  Актуальная отложка MAX и предлагаемые времена UTC/МСК;
+                  без сохранения назначений, изменения очереди, файлов и постов.
 Без команды: прежний режим idle до SIGINT/SIGTERM.
 Настройки Pinterest: DATA_DIR, PINTEREST_BOARD_URL (https://ru.pinterest.com/mixi56453/max7),
 PINTEREST_BROWSER_CHANNEL (chromium по умолчанию; chrome — явный выбор Google Chrome).
 Настройки MAX: MAX_CHANNEL_URL (обязателен), MAX_BROWSER_CHANNEL (chromium или chrome).
+Для run: SYNC_INTERVAL_SECONDS (300; положительное число, максимум 2147483.647).
+Для plan/run: PUBLICATION_SLOTS (HH:mm через запятую), PLANNING_HORIZON_DAYS (14),
+MAX_SCHEDULED_LIMIT (обязателен); нужен уже привязанный через auth max канал.
 Пароли и коды вводятся только на сайте, CLI их не запрашивает.
 При занятом профиле сначала остановите использующий его процесс.`;
 
 /** Проверяет команду до создания файлов и запуска браузера. */
-export function parseCommand(args: string[]): 'idle' | 'help' | 'auth-pinterest' | 'auth-max' | 'sync' | 'sync-full' | 'bootstrap' | 'queue-list' | { mode: 'queue-change'; action: 'skip' | 'retry'; id: number } | { mode: 'backfill'; count: number; resume?: string } {
+export function parseCommand(args: string[]): 'idle' | 'run' | 'help' | 'auth-pinterest' | 'auth-max' | 'plan-dry-run' | 'sync' | 'sync-full' | 'bootstrap' | 'queue-list' | { mode: 'queue-change'; action: 'skip' | 'retry'; id: number } | { mode: 'backfill'; count: number; resume?: string } {
   if (args.length === 0) return 'idle';
+  if (args.length === 1 && args[0] === 'run') return 'run';
   if (args.length === 1 && args[0] === '--help') return 'help';
   if (args.length === 2 && args[0] === 'auth' && args[1] === 'max') return 'auth-max';
+  if (args.length === 2 && args[0] === 'plan' && args[1] === '--dry-run') return 'plan-dry-run';
   if (args.length === 2 && args[0] === 'auth' && args[1] === 'pinterest') return 'auth-pinterest';
   if (args.length === 2 && args[0] === 'queue' && args[1] === 'list') return 'queue-list';
   if (args.length === 1 && args[0] === 'bootstrap') return 'bootstrap';
@@ -90,7 +100,7 @@ export function pinterestConfiguration(env: NodeJS.ProcessEnv) {
 export function maxConfiguration(env: NodeJS.ProcessEnv) {
   const directory = env.DATA_DIR ?? './data';
   if (!directory.trim()) throw new Error('DATA_DIR должен содержать путь к каталогу');
-  if (!env.MAX_CHANNEL_URL?.trim()) throw new Error('MAX_CHANNEL_URL обязателен для auth max');
+  if (!env.MAX_CHANNEL_URL?.trim()) throw new Error('MAX_CHANNEL_URL обязателен для работы с MAX');
 
   let target: URL;
   try {
@@ -110,4 +120,33 @@ export function maxConfiguration(env: NodeJS.ProcessEnv) {
   target.pathname = target.pathname.replace(/\/$/, '');
 
   return { dataDirectory: resolve(directory), channelUrl: target.href, channel };
+}
+
+/** Проверяет только слоты и горизонт; настройки интеграций здесь не требуются. */
+export function planningConfiguration(env: NodeJS.ProcessEnv): PublicationSchedule {
+  const horizon = env.PLANNING_HORIZON_DAYS ?? '14';
+  if (!/^[1-9]\d*$/.test(horizon)) {
+    throw new Error('PLANNING_HORIZON_DAYS должен быть положительным целым числом');
+  }
+
+  return new PublicationSchedule((env.PUBLICATION_SLOTS ?? '').split(','), Number(horizon));
+}
+
+/** Проверяет общий лимит MAX до открытия браузера. */
+export function maxScheduledLimit(env: NodeJS.ProcessEnv): number {
+  const limit = env.MAX_SCHEDULED_LIMIT ?? '';
+  if (!/^[1-9]\d*$/.test(limit) || !Number.isSafeInteger(Number(limit))) throw new Error('MAX_SCHEDULED_LIMIT должен быть положительным целым числом');
+
+  return Number(limit);
+}
+
+/** Ограничивает интервал диапазоном таймера Node, исключая переполнение в быстрый цикл. */
+export function syncInterval(env: NodeJS.ProcessEnv): number {
+  const seconds = env.SYNC_INTERVAL_SECONDS ?? '300';
+  const milliseconds = Number(seconds) * 1000;
+  if (!/^(?:\d+\.?\d*|\.\d+)$/.test(seconds) || !Number.isFinite(milliseconds) || milliseconds < 1 || milliseconds > 2_147_483_647) {
+    throw new Error('SYNC_INTERVAL_SECONDS должен быть положительным числом от 0.001 до 2147483.647');
+  }
+
+  return milliseconds;
 }

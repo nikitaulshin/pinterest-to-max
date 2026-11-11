@@ -28,6 +28,7 @@ if (process.env.QUEUE_FIXTURE_VERSION === '1') {
     DROP TABLE bootstrap_runs;
     DROP TABLE backfill_runs;
     DROP TABLE queue_events;
+    DROP TABLE max_attempts;
     UPDATE board_state SET initialized = 0, last_full_sync_at = NULL;
     PRAGMA user_version = 1;
     COMMIT;`);
@@ -61,6 +62,13 @@ chromium.launchPersistentContext = async (directory, options) => {
   const context = await launch(directory, options);
   const page = context.pages()[0] ?? await context.newPage();
   const scenario = process.env.SYNC_SCENARIO;
+  if (scenario === 'download-failure' || scenario === 'unsupported') {
+    const screenshot = page.screenshot.bind(page);
+    page.screenshot = async (options) => {
+      console.log(JSON.stringify({ event: 'fixture-error-screenshot', url: page.url() }));
+      return await screenshot(options);
+    };
+  }
   const signature = 'c6c5d3974290d1bff2e2f72626f49add';
   const image = `https://i.pinimg.com/originals/c6/c5/d3/${signature}.png`;
   const png = Buffer.from(await page.evaluate((changed) => {

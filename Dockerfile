@@ -10,6 +10,7 @@ RUN npm ci \
 
 COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
+COPY scripts/pinterest-session-state.ts ./scripts/pinterest-session-state.ts
 RUN npm run build \
     && npm prune --omit=dev \
     && mkdir -p /app/data \
@@ -18,4 +19,4 @@ RUN npm run build \
 ENV NODE_ENV=production
 ENV DATA_DIR=/app/data
 USER node
-CMD ["node", "dist/main.js"]
+ENTRYPOINT ["node", "dist/main.js"]

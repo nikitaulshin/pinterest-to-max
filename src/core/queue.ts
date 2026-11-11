@@ -32,11 +32,16 @@ export class QueueJob {
   }
 }
 
-/** Выбирает FIFO среди безопасных ready с наступившим временем повтора. */
-export function nextReadyJob(states: QueueState[], now: Date): number | null {
+/** Возвращает FIFO безопасных ready с наступившим временем повтора, не меняя снимок. */
+export function readyJobs<T extends QueueState>(states: T[], now: Date): T[] {
   const ready = states.filter((state) => state.status === 'ready' && !state.max_post_url
     && (state.next_attempt_at === null || Date.parse(state.next_attempt_at) <= now.getTime()));
   ready.sort((a, b) => a.added_at.localeCompare(b.added_at) || a.id - b.id);
 
-  return ready[0]?.id ?? null;
+  return ready;
+}
+
+/** Выбирает FIFO среди безопасных ready с наступившим временем повтора. */
+export function nextReadyJob(states: QueueState[], now: Date): number | null {
+  return readyJobs(states, now)[0]?.id ?? null;
 }

@@ -1,6 +1,7 @@
 import { setTimeout } from 'node:timers/promises';
 import type { Page } from 'playwright';
 import { boardPinIdentity, imageCandidates } from './pin.ts';
+import { integrationFailure } from '../failure.ts';
 import { readBoardAccess } from './session.ts';
 
 /** Подтверждённый источник без предположений о пригодности изображения. */
@@ -18,6 +19,7 @@ export interface BoardTraversal {
   pins: BoardPin[];
   expectedCount: number | null;
   reason: string;
+  failureReason?: string;
 }
 
 /** Обходит всю доску по значениям карточек, не удерживая виртуализируемые DOM-узлы. */
@@ -110,6 +112,7 @@ export async function traverseBoard(page: Page, boardUrl: string, options: { tim
 
     return result('partial', 'timeout');
   } catch (error) {
-    return result('partial', error instanceof Error && error.message.startsWith('Pinterest:') ? 'structure-changed' : 'browser-error');
+    const failure = integrationFailure(error);
+    return { ...result('partial', failure.code === 'network' ? 'network' : error instanceof Error && error.message.startsWith('Pinterest:') ? 'structure-changed' : 'browser-error'), failureReason: failure.message };
   }
 }

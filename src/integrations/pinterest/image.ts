@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Page } from 'playwright';
 import type { BoardPin } from './board.ts';
+import { IntegrationFailure, integrationFailure } from '../failure.ts';
 import { extractPin, imageCandidates } from './pin.ts';
 
 /** Файл готов только после проверки всех наблюдённых вариантов и атомарного сохранения. */
@@ -27,6 +28,7 @@ export interface ImageFailure {
   url: string;
   imageUrl: string | null;
   reason: string;
+  code?: string;
 }
 
 /** Проверяет контейнер, чтобы терпимый декодер не принимал оборванное изображение. */
@@ -50,6 +52,7 @@ export async function downloadPinImage(page: Page, pin: { id: string; url: strin
       imageUrl = url;
       const response = await page.context().request.get(url, { maxRedirects: 0, timeout: 30_000 });
       try {
+        if ([408, 429, 500, 502, 503, 504].includes(response.status())) throw new IntegrationFailure('network', `Pinterest: временный отказ CDN HTTP ${response.status()}.`);
         if (response.status() !== 200 || response.url() !== url) throw new Error('Pinterest: CDN вернул отказ или перенаправление.');
         const headers = response.headers();
         const mime = (headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
@@ -88,7 +91,7 @@ export async function downloadPinImage(page: Page, pin: { id: string; url: strin
 
     return { status: 'ready', id: pin.id, url: pin.url, imageUrl, path, sha256, mime: best.mime, bytes: best.bytes.length, width: best.width, height: best.height, variants };
   } catch (error) {
-    return { status: 'failed', id: pin.id, url: pin.url, imageUrl, reason: error instanceof Error && error.message.startsWith('Pinterest:') ? error.message : 'Pinterest: загрузка, декодирование или сохранение изображения не завершены.' };
+    return { status: 'failed', code: integrationFailure(error).code, id: pin.id, url: pin.url, imageUrl, reason: integrationFailure(error).code === 'network' ? integrationFailure(error).message : error instanceof Error && error.message.startsWith('Pinterest:') ? error.message : 'Pinterest: загрузка, декодирование или сохранение изображения не завершены.' };
   } finally {
     if (temporary) await rm(temporary, { force: true }).catch(() => { /* Ошибка уборки не скрывает исходный отказ; .part не считается готовым. */ });
   }
@@ -99,6 +102,6 @@ export async function preparePinImage(page: Page, pin: BoardPin, boardUrl: strin
   try {
     return await downloadPinImage(page, await extractPin(page, pin, boardUrl), dataDirectory);
   } catch (error) {
-    return { status: 'failed', id: pin.id, url: pin.url, imageUrl: null, reason: error instanceof Error && error.message.startsWith('Pinterest:') ? error.message : 'Pinterest: представление пина не подтверждено.' };
+    return { status: 'failed', code: integrationFailure(error).code, id: pin.id, url: pin.url, imageUrl: null, reason: integrationFailure(error).code === 'network' ? integrationFailure(error).message : error instanceof Error && error.message.startsWith('Pinterest:') ? error.message : 'Pinterest: представление пина не подтверждено.' };
   }
 }

@@ -1,12 +1,15 @@
 import { mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { help, parseCommand, pinterestConfiguration, maxConfiguration } from './cli.ts';
+import { help, parseCommand, pinterestConfiguration, maxConfiguration, planningConfiguration, maxScheduledLimit, syncInterval } from './cli.ts';
+import { PublicationPlanner } from './core/planning.ts';
 import { authenticatePinterest } from './integrations/pinterest/session.ts';
 import { ImportStorage, listQueue, channelBoard } from './storage.ts';
 import { acquireStorageOwnership } from './storage-ownership.ts';
 import { authenticateMax } from './integrations/max/session.ts';
 import { syncPinterest } from './integrations/pinterest/sync.ts';
+import { runAutomation, validateRunStorage } from './run.ts';
+import { previewPlan } from './integrations/max/plan.ts';
 
 process.umask(0o077);
 
@@ -22,6 +25,38 @@ async function main(): Promise<number> {
   const dataDirectory = resolve(directory);
   if (command === 'queue-list') {
     console.log(JSON.stringify(listQueue(dataDirectory)));
+    return 0;
+  }
+
+  if (command === 'plan-dry-run') {
+    const max = maxConfiguration(process.env);
+    const schedule = planningConfiguration(process.env);
+    const limit = maxScheduledLimit(process.env);
+    const planner = new PublicationPlanner(schedule, limit);
+    schedule.futureSlots(new Date()).next();
+
+    const release = acquireStorageOwnership(dataDirectory);
+    try { await previewPlan(max, planner, limit); } finally { release(); }
+    return 0;
+  }
+
+  if (command === 'run') {
+    const missing = ['MAX_CHANNEL_URL', 'PUBLICATION_SLOTS', 'MAX_SCHEDULED_LIMIT'].filter((name) => !process.env[name]?.trim());
+    if (missing.length) throw new Error(`Для run нужны настройки: ${missing.join(', ')}`);
+
+    const pinterest = pinterestConfiguration(process.env);
+    const max = maxConfiguration(process.env);
+    const schedule = planningConfiguration(process.env);
+    const planner = new PublicationPlanner(schedule, maxScheduledLimit(process.env));
+    const interval = syncInterval(process.env);
+    schedule.futureSlots(new Date()).next();
+    validateRunStorage(dataDirectory, pinterest.boardUrl, max.channelUrl);
+
+    const release = acquireStorageOwnership(dataDirectory);
+    try {
+      validateRunStorage(dataDirectory, pinterest.boardUrl, max.channelUrl);
+      await runAutomation(pinterest, max, planner, interval);
+    } finally { release(); }
     return 0;
   }
 

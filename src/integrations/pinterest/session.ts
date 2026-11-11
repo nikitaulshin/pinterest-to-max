@@ -1,3 +1,6 @@
+import { randomUUID } from 'node:crypto';
+import { IntegrationFailure, integrationFailure } from '../failure.ts';
+import { reportBrowserFailure } from '../diagnostics.ts';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
@@ -56,8 +59,10 @@ export async function authenticatePinterest(configuration: { dataDirectory: stri
   const context = await chromium.launchPersistentContext(profile, {
     headless: false,
     ...(configuration.channel === 'chrome' ? { channel: 'chrome' } : {}),
-  }).catch(() => {
-    throw new Error('Не удалось открыть браузер Pinterest. Установите Chromium или проверьте выбранный Chrome; если профиль занят, остановите его владельца.');
+  }).catch(async (error: unknown) => {
+    throw await reportBrowserFailure({ service: 'pinterest', operation: 'auth',
+      directory: join(configuration.dataDirectory, 'diagnostics', `pinterest-auth-${randomUUID()}`),
+      error: new IntegrationFailure(integrationFailure(error).code, 'Pinterest: не удалось открыть браузер; проверьте установку выбранного браузера и владельца профиля.', undefined, error) });
   });
   const controller = new AbortController();
   const stop = () => { controller.abort(); };
@@ -94,12 +99,12 @@ export async function authenticatePinterest(configuration: { dataDirectory: stri
     throw new Error('Pinterest: доступ не подтверждён за 5 минут. Повторите auth pinterest для ручного входа.');
   } catch (error) {
     if (controller.signal.aborted) return;
-    if (error instanceof Error && error.message.startsWith('Pinterest:')) throw error;
-
-    throw new Error('Pinterest: браузерная проверка не завершена. Проверьте сеть и доступ, затем повторите auth pinterest.', { cause: error });
+    throw await reportBrowserFailure({ service: 'pinterest', operation: 'auth',
+      directory: join(configuration.dataDirectory, 'diagnostics', `pinterest-auth-${randomUUID()}`),
+      error, page: context.pages()[0] });
   } finally {
     process.removeListener('SIGINT', stop);
     process.removeListener('SIGTERM', stop);
-    await context.close();
+    await context.close().catch(() => {});
   }
 }

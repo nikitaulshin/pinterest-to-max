@@ -13,6 +13,7 @@ browser-profiles/
 .auth/
 images/
 downloads/
+diagnostics/
 *.db
 *.db-*
 *.sqlite

@@ -8,6 +8,7 @@ const target = 'https://max.ru/channel_du';
 
 for (const scenario of [
   { name: 'matching profile and enabled author controls confirm access', identity: target, controls: true, expected: 'ready' },
+  { name: 'empty scheduler does not revoke author access', identity: target, controls: true, empty: true, expected: 'ready' },
   { name: 'another profile cannot confirm configured channel', identity: 'https://max.ru/other', controls: true, expected: 'mismatch' },
   { name: 'matching profile without publication controls cannot confirm rights', identity: target, controls: false, expected: 'unknown' },
   { name: 'disabled author controls cannot confirm rights', identity: target, controls: true, disabled: true, expected: 'unknown' },
@@ -20,7 +21,7 @@ for (const scenario of [
       await page.route('https://web.max.ru/**', (route) => route.fulfill({ contentType: 'text/html; charset=utf-8', body: `
         <button aria-label="Открыть профиль Маркетинг">Маркетинг</button>
         <button><span data-type="action-small">Ссылка</span><span data-type="description"><span data-type="body">${scenario.identity}</span></span></button>
-        ${scenario.controls ? `<button aria-label="Загрузить файл" ${scenario.disabled ? 'disabled' : ''}></button><button aria-label="Открыть отложенные сообщения"></button>` : ''}
+        ${scenario.controls ? `<button aria-label="Загрузить файл" ${scenario.disabled ? 'disabled' : ''}></button>${scenario.empty ? '' : '<button aria-label="Открыть отложенные сообщения"></button>'}` : ''}
         ${scenario.login ? '<button>Войти по номеру телефона</button>' : ''}
       ` }));
       await page.goto('https://web.max.ru/-123');

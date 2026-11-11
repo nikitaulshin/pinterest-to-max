@@ -48,7 +48,7 @@ async function run(scenario: string, full = false) {
       assert.ok((await stat(result.path)).size > 0, 'Ready result must reference a real file');
     }
 
-    return { code, summary, results };
+    return { code, summary, results, screenshots: events.filter((event) => event.event === 'fixture-error-screenshot') };
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
@@ -64,11 +64,13 @@ for (const full of [false, true]) {
 
 for (const scenario of ['unsupported', 'download-failure']) {
   test(`${scenario} retains its failure and later sources still download`, async () => {
-    const { code, summary, results } = await run(scenario);
+    const { code, summary, results, screenshots } = await run(scenario);
     assert.equal(code, 1, 'Material failure must produce nonzero exit');
     assert.equal(summary.traversalStatus, 'complete', 'Material failure must not change traversal completeness');
     assert.equal(summary.materialFailures, 1, 'Material failures must be counted separately');
     assert.deepEqual(results.map((result) => result.status), ['ready', 'failed', 'ready'], 'A failed material must not lose later images');
+    assert.equal(screenshots.length, 1, 'Later successful pins must not overwrite the original error screenshot');
+    assert.equal(summary.screenshotAvailable, true, 'The original error screenshot must remain available in the final summary');
   });
 }
 

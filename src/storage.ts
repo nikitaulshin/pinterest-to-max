@@ -1,3 +1,4 @@
+import { networkRetryDelay } from './core/retry.ts';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync } from 'node:fs';
 import { join, relative } from 'node:path';
@@ -30,10 +31,10 @@ export class ImportStorage {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     this.#database = new DatabaseSync(join(directory, 'state.sqlite'));
     try {
-      this.#database.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;');
+      this.#database.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;');
       this.#transaction(() => {
         const version = this.#database.prepare('PRAGMA user_version').get()!.user_version;
-        if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4) throw new Error('Неподдерживаемая версия хранилища');
+        if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5) throw new Error('Неподдерживаемая версия хранилища');
         if (version === 0) this.#database.exec(`
           CREATE TABLE board_state (
             id INTEGER PRIMARY KEY CHECK (id = 1), board_url TEXT NOT NULL, channel_url TEXT,
@@ -79,6 +80,14 @@ export class ImportStorage {
             occurred_at TEXT NOT NULL, action TEXT NOT NULL, previous_state TEXT NOT NULL
           );
           PRAGMA user_version = 4;
+        `);
+        if (Number(version) < 5) this.#database.exec(`
+          CREATE TABLE max_attempts (
+            id TEXT PRIMARY KEY, queue_id INTEGER NOT NULL REFERENCES queue(id),
+            channel_url TEXT NOT NULL, image_sha256 TEXT NOT NULL, scheduled_at TEXT NOT NULL,
+            started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, evidence TEXT, error TEXT
+          );
+          PRAGMA user_version = 5;
         `);
         const board = this.#database.prepare('SELECT board_url FROM board_state WHERE id = 1').get();
         if (boardUrl && board && board.board_url !== boardUrl) throw new Error('Доска хранилища не совпадает с PINTEREST_BOARD_URL; используйте другой DATA_DIR');
@@ -246,6 +255,129 @@ export class ImportStorage {
     });
   }
 
+  /** Захватывает только безопасное ready и сохраняет предварительное назначение. */
+  prepareMax(id: number, channelUrl: string, scheduledAt: string) {
+    let image: { path: string; sha256: string; mime: string } | undefined;
+    this.#transaction(() => {
+      const board = this.#database.prepare('SELECT channel_url FROM board_state WHERE id = 1').get();
+      if (board?.channel_url !== channelUrl) throw new Error('MAX: канал хранилища не подтверждён.');
+      const job = this.#database.prepare(`SELECT queue.*, images.path, images.mime FROM queue
+        JOIN images ON images.sha256 = queue.image_sha256 WHERE queue.id = ?`).get(id);
+      if (!job || job.status !== 'ready' || job.max_post_url
+        || this.#database.prepare('SELECT 1 FROM max_attempts WHERE queue_id = ?').get(id)
+        || job.next_attempt_at && Date.parse(String(job.next_attempt_at)) > Date.now()) throw new Error('MAX: задание не готово к безопасной отправке.');
+
+      this.#database.prepare(`INSERT INTO queue_events (queue_id, occurred_at, action, previous_state)
+        VALUES (?, ?, 'prepare-max', ?)`).run(id, new Date().toISOString(), JSON.stringify(job));
+      this.#database.prepare("UPDATE queue SET status = 'preparing', scheduled_at = ? WHERE id = ?").run(scheduledAt, id);
+      image = { path: join(this.#directory, String(job.path)), sha256: String(job.image_sha256), mime: String(job.mime) };
+    });
+
+    return image!;
+  }
+
+  /** Надёжно сохраняет намерение вместе с submitting до единственного возможного создания. */
+  beginMaxAttempt(id: number, channelUrl: string, sha256: string, scheduledAt: string): string {
+    const attempt = randomUUID();
+    this.#transaction(() => {
+      const changed = this.#database.prepare(`UPDATE queue SET status = 'submitting'
+        WHERE id = ? AND status = 'preparing' AND image_sha256 = ? AND scheduled_at = ?`).run(id, sha256, scheduledAt);
+      if (changed.changes !== 1) throw new Error('MAX: намерение не соответствует подготовленному заданию.');
+
+      this.#database.prepare(`INSERT INTO max_attempts
+        (id, queue_id, channel_url, image_sha256, scheduled_at, started_at, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'submitting')`).run(attempt, id, channelUrl, sha256, scheduledAt, new Date().toISOString());
+    });
+
+    return attempt;
+  }
+
+  /** Читает только неопределённую попытку, связанную с текущим назначением и файлом задания. */
+  maxReconciliation(id: number, channelUrl: string) {
+    const rows = this.#database.prepare(`SELECT max_attempts.id AS attempt, queue.scheduled_at, queue.image_sha256, images.path, images.mime
+      FROM queue JOIN images ON images.sha256 = queue.image_sha256
+      JOIN max_attempts ON max_attempts.queue_id = queue.id AND max_attempts.status = 'uncertain'
+        AND max_attempts.image_sha256 = queue.image_sha256 AND max_attempts.scheduled_at = queue.scheduled_at
+      JOIN board_state ON board_state.id = 1 AND board_state.channel_url = max_attempts.channel_url
+      WHERE queue.id = ? AND queue.status = 'uncertain' AND max_attempts.channel_url = ?`).all(id, channelUrl);
+    if (rows.length !== 1) throw new Error('MAX: нет единственной связанной неопределённой попытки.');
+    const row = rows[0]!;
+
+    return { attempt: String(row.attempt), scheduledAt: String(row.scheduled_at), sha256: String(row.image_sha256), path: join(this.#directory, String(row.path)), mime: String(row.mime) };
+  }
+
+  /** Сохраняет исход и доказательства, не теряя файл и прежние попытки. */
+  finishMax(id: number, status: 'ready' | 'failed' | 'uncertain' | 'scheduled', error: string | null, attempt?: string, evidence?: string) {
+    this.#transaction(() => {
+      const state = this.#database.prepare('SELECT * FROM queue WHERE id = ?').get(id);
+      if (status === 'scheduled' && !evidence) throw new Error('MAX: подтверждение требует доказательств создания поста.');
+      const reconciling = state?.status === 'uncertain' && status === 'scheduled' && !!attempt && !!evidence;
+      if (!state || (attempt ? state.status !== 'submitting' && !reconciling : state.status !== 'preparing')) throw new Error('MAX: недопустимое завершение отправки.');
+      if (attempt && !['scheduled', 'uncertain'].includes(status)) throw new Error('MAX: возможное создание требует сверки.');
+      if (!attempt && ['scheduled', 'uncertain'].includes(status)) throw new Error('MAX: отсутствует намерение отправки.');
+
+      this.#database.prepare(`INSERT INTO queue_events (queue_id, occurred_at, action, previous_state)
+        VALUES (?, ?, ?, ?)`).run(id, new Date().toISOString(), `max-${status}`, JSON.stringify(state));
+      if (attempt) {
+        const changed = this.#database.prepare(`UPDATE max_attempts SET status = ?, finished_at = ?, error = ?, evidence = ?
+          WHERE id = ? AND queue_id = ? AND status = ? AND image_sha256 = ? AND scheduled_at = ?
+            AND channel_url = (SELECT channel_url FROM board_state WHERE id = 1)`).run(status, new Date().toISOString(), error, evidence ?? null, attempt, id, state.status!, state.image_sha256!, state.scheduled_at!);
+        if (changed.changes !== 1) throw new Error('MAX: попытка отправки не найдена.');
+      }
+      this.#database.prepare('UPDATE queue SET status = ?, error = ?, next_attempt_at = NULL WHERE id = ?').run(status, error, id);
+    });
+  }
+
+  /** Откладывает только доказанный сетевой отказ до намерения; история ограничивает число повторов. */
+  deferMaxNetworkRetry(id: number, intervalMs: number): void {
+    this.#transaction(() => {
+      const state = this.#database.prepare(`SELECT * FROM queue WHERE id = ? AND status = 'failed'
+        AND max_post_url IS NULL AND next_attempt_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM max_attempts WHERE queue_id = queue.id)`).get(id);
+      if (!state) throw new Error('MAX: сетевой повтор допустим только до намерения отправки.');
+      const count = this.#database.prepare("SELECT COUNT(*) AS count FROM queue_events WHERE queue_id = ? AND action = 'max-network-delay'").get(id)!;
+      const delay = networkRetryDelay(intervalMs, Number(count.count) + 1);
+      if (delay === null) return;
+
+      this.#database.prepare(`INSERT INTO queue_events (queue_id, occurred_at, action, previous_state)
+        VALUES (?, ?, 'max-network-delay', ?)`).run(id, new Date().toISOString(), JSON.stringify(state));
+      this.#database.prepare('UPDATE queue SET next_attempt_at = ? WHERE id = ?').run(new Date(Date.now() + delay).toISOString(), id);
+    });
+  }
+
+  /** Возвращает наступившие сетевые отказы в FIFO, сохраняя причину и защищая любые внешние попытки. */
+  resumeMaxNetworkRetries(): void {
+    this.#transaction(() => {
+      const due = this.#database.prepare(`SELECT * FROM queue WHERE status = 'failed' AND max_post_url IS NULL
+        AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?
+        AND EXISTS (SELECT 1 FROM queue_events WHERE queue_id = queue.id AND action = 'max-network-delay')
+        AND NOT EXISTS (SELECT 1 FROM max_attempts WHERE queue_id = queue.id)`).all(new Date(Date.now()).toISOString());
+      for (const state of due) {
+        this.#database.prepare(`INSERT INTO queue_events (queue_id, occurred_at, action, previous_state)
+          VALUES (?, ?, 'max-network-retry', ?)`).run(state.id!, new Date().toISOString(), JSON.stringify(state));
+        this.#database.prepare("UPDATE queue SET status = 'ready', next_attempt_at = NULL WHERE id = ?").run(state.id!);
+      }
+    });
+  }
+
+  /** Атомарно снимает захваты погибшего владельца; любое намерение остаётся только для сверки. */
+  recoverMaxInterrupted(): void {
+    this.#transaction(() => {
+      const interrupted = this.#database.prepare("SELECT * FROM queue WHERE status IN ('preparing', 'submitting')").all();
+      for (const state of interrupted) {
+        const attempts = this.#database.prepare('SELECT * FROM max_attempts WHERE queue_id = ?').all(state.id!);
+        const status = state.status === 'preparing' && !state.max_post_url && attempts.length === 0 ? 'ready' : 'uncertain';
+        const now = new Date().toISOString();
+        this.#database.prepare(`INSERT INTO queue_events (queue_id, occurred_at, action, previous_state)
+          VALUES (?, ?, 'max-recovery', ?)`).run(state.id!, now, JSON.stringify(state));
+        this.#database.prepare(`UPDATE max_attempts SET status = 'uncertain', finished_at = ?
+          WHERE queue_id = ? AND status = 'submitting'`).run(now, state.id!);
+        this.#database.prepare(`UPDATE queue SET status = ?, scheduled_at = ?, next_attempt_at = NULL WHERE id = ?`)
+          .run(status, status === 'ready' ? null : state.scheduled_at!, state.id!);
+      }
+    });
+  }
+
   /** Закрывает соединение после завершения импорта. */
   close() { this.#database.close(); }
 
@@ -266,7 +398,7 @@ export function listQueue(directory: string) {
   const database = new DatabaseSync(join(directory, 'state.sqlite'), { readOnly: true });
   try {
     const version = database.prepare('PRAGMA user_version').get()!.user_version;
-    if (version !== 1 && version !== 2 && version !== 3 && version !== 4) {
+    if (version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5) {
       throw new Error('Хранилище очереди ещё не инициализировано или его версия не поддерживается');
     }
     database.exec('BEGIN');
@@ -276,6 +408,7 @@ export function listQueue(directory: string) {
       ORDER BY queue.added_at, queue.id`).all();
     const nextReadyId = nextReadyJob(items as unknown as QueueState[], new Date());
     const queueEvents = version >= 4 ? database.prepare('SELECT * FROM queue_events ORDER BY id').all() : [];
+    const maxAttempts = version >= 5 ? database.prepare('SELECT * FROM max_attempts ORDER BY started_at, id').all() : [];
     const sources = database.prepare('SELECT * FROM pins ORDER BY first_seen_at, id').all();
     const history = version >= 2 ? {
       board: database.prepare('SELECT * FROM board_state').get(),
@@ -284,7 +417,7 @@ export function listQueue(directory: string) {
     } : {};
     database.exec('COMMIT');
 
-    return { event: 'queue-list', items, sources, nextReadyId, queueEvents, ...history };
+    return { event: 'queue-list', items, sources, nextReadyId, queueEvents, maxAttempts, ...history };
   } finally { database.close(); }
 }
 
